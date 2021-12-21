@@ -132,10 +132,10 @@ def main():
 
     # Image logger
     def get_images(params, x):
-        originals = jnp.concatenate(x, axis=2)
-        reconstructed = jnp.concatenate(model.apply(params, x), axis=2)
-        combined = jnp.concatenate([originals, reconstructed], axis=1)
-        transposed = jnp.transpose(combined, (0, 3, 1, 2))
+        originals = jnp.concatenate(x, axis=1)
+        reconstructed = jnp.concatenate(model.apply(params, x), axis=1)
+        combined = jnp.concatenate([originals, reconstructed], axis=0)
+        transposed = jnp.transpose(combined, (2, 0, 1))
         return wandb.Image(np.array(transposed) * 255.0)
 
     # Training loop
@@ -145,8 +145,6 @@ def main():
             x = jnp.transpose(x, (0, 2, 3, 1))
             params, opt_state, l2 = update(params, opt_state, x, y)
             if step % wandb.config.log_every == 0:
-                print(x.shape)
-                print(model.apply(params, x).shape)
                 wandb.log({'Loss': l2, 'Samples': get_images(params, x[:wandb.config.log_images])})
             step += 1
 
