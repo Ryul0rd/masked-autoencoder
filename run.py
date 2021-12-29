@@ -23,24 +23,22 @@ def numpy_collate(batch):
 def to_numpy(pic):
     return np.array(pic, dtype=jnp.float32)
 
-class Autoencoder(hk.Module):
+# class Autoencoder(hk.Module):
 
-    def __init__(self, name=None):
-        super().__init__(name=name)
-        self.nn = hk.Sequential([
-            hk.Flatten(),
-            hk.Linear(256), jax.nn.relu,
-            hk.Linear(128), jax.nn.relu,
-            hk.Linear(256), jax.nn.relu,
-            hk.Linear(784), jax.nn.sigmoid,
-        ])
+#     def __init__(self, name=None):
+#         super().__init__(name=name)
+#         self.nn = hk.Sequential([
+#             hk.Flatten(),
+#             hk.Linear(256), jax.nn.relu,
+#             hk.Linear(128), jax.nn.relu,
+#             hk.Linear(256), jax.nn.relu,
+#             hk.Linear(784), jax.nn.sigmoid,
+#         ])
 
-    def __call__(self, x):
-        return jnp.reshape(self.nn(x), (-1, 1, 28, 28))
-
+#     def __call__(self, x):
+#         return jnp.reshape(self.nn(x), (-1, 1, 28, 28))
 
 class TransformerBlock(hk.Module):
-
     def __init__(self, model_size, num_heads, name=None):
         super().__init__(name=name)
         self.mha = hk.MultiHeadAttention(num_heads=num_heads, key_size=model_size, w_init_scale=1.0, model_size=model_size)
@@ -56,27 +54,31 @@ class TransformerBlock(hk.Module):
 
 
 class MaskedAutoencoder(hk.Module):
-
-    def __init__(self, model_size=128, blocks=2, name=None):
+    def __init__(self, model_size=128, encoder_blocks=2, decoder_blocks=2, name=None):
         super().__init__(name=name)
-        self.nn = hk.Sequential([
+        self.patch = hk.Sequential([
             hk.Conv2D(output_channels=model_size, kernel_shape=4, stride=4),
             hk.Reshape(output_shape=(49, model_size)),
-            hk.Sequential([TransformerBlock(model_size=model_size, num_heads=2) for _ in range(blocks)]),
+        ])
+        self.pos_embedding = hk.Embed(vocab_size=49, embed_dim=model_size)
+        #self.encoder = hk.Sequential([TransformerBlock(model_size=model_size, num_heads=2) for _ in range(encoder_blocks)])
+        #self.decoder = hk.Sequential([TransformerBlock(model_size=model_size, num_heads=2) for _ in range(decoder_blocks)])
+        self.unpatch = hk.Sequential([
             hk.Reshape(output_shape=(7, 7, model_size)),
             hk.Conv2DTranspose(output_channels=1, kernel_shape=4, stride=4),
         ])
-        # self.patch = hk.Conv2D(output_channels=model_size, kernel_shape=4, stride=4)
-        # self.transformer = hk.Sequential([TransformerBlock(model_size=model_size, num_heads=2) for _ in range(2)])
-        # self.unpatch = hk.Conv2DTranspose(output_channels=1, kernel_shape=4, stride=4)
 
     def __call__(self, x):
-        # x = relu(self.patch(x))
-        # x = jnp.reshape(x, (-1, 49, self.model_size))
-        # x = self.transformer(x)
-        # x = jnp.reshape(x, (-1, 7, 7, self.model_size))
-        # x = sigmoid(self.unpatch(x))
-        return self.nn(x)
+        x = self.patch(x)
+        x += self.pos_embedding(jnp.arange(49))
+        # Permute sequence
+        # Chop off last bit
+        #x = self.encoder(x)
+        # Attach 'blank' embeddings
+        # Reverse permutation
+        #x = self.decoder(x)
+        x = self.unpatch(x)
+        return x
 
 def main():
 
@@ -91,7 +93,7 @@ def main():
         }
 
     # Do some wandb logging
-    wandb.init(project="masked-autoencoder", config=config)
+    wandb.init(project='masked-autoencoder', config=config)
 
     # Create dataloaders
     transform = transforms.Compose([
@@ -107,7 +109,7 @@ def main():
     key = jax.random.PRNGKey(wandb.config.rng_seed)
 
     # Define a model fn then transform it to be functionally pure
-    model = hk.without_apply_rng(hk.transform(lambda x: MaskedAutoencoder()(x)))
+    model = hk.transform(lambda x: MaskedAutoencoder()(x))
     # Initialize some paramters using our rng keys and a tracer value
     key, subkey = jax.random.split(key)
     params = model.init(subkey, jnp.zeros(shape=(wandb.config.batch_size, 28, 28, 1)))
@@ -117,23 +119,23 @@ def main():
 
     # Define our loss function
     @jax.jit
-    def loss(params, x):
-        recon = model.apply(params, x)
+    def loss(params, rng_key, x):
+        recon = model.apply(params, rng_key, x)
         l2 = jnp.mean(optax.l2_loss(recon, x))
         return l2
 
     # Define our update function so we can jit it
     @jax.jit
-    def update(params, opt_state, x, y):
-        l2, grads = jax.value_and_grad(loss)(params, x)
+    def update(params, opt_state, rng_key, x, y):
+        l2, grads = jax.value_and_grad(loss)(params, rng_key, x)
         updates, opt_state = opt.update(grads, opt_state)
         params = optax.apply_updates(params, updates)
         return params, opt_state, l2
 
     # Image logger
-    def get_images(params, x):
+    def get_images(params, rng_key, x):
         originals = jnp.concatenate(x, axis=1)
-        reconstructed = jnp.concatenate(model.apply(params, x), axis=1)
+        reconstructed = jnp.concatenate(model.apply(params, rng_key, x), axis=1)
         combined = jnp.concatenate([originals, reconstructed], axis=0)
         transposed = jnp.transpose(combined, (2, 0, 1))
         return wandb.Image(np.array(transposed) * 255.0)
@@ -141,11 +143,14 @@ def main():
     # Training loop
     step = 0
     for epoch in range(wandb.config.epochs):
+        print(f'Starting epoch {epoch + 1}/{wandb.config.epochs}')
         for x, y in train_loader:
             x = jnp.transpose(x, (0, 2, 3, 1))
-            params, opt_state, l2 = update(params, opt_state, x, y)
+            key, subkey = jax.random.split(key)
+            params, opt_state, l2 = update(params, opt_state, subkey, x, y)
             if step % wandb.config.log_every == 0:
-                wandb.log({'Loss': l2, 'Samples': get_images(params, x[:wandb.config.log_images])})
+                key, subkey = jax.random.split(key)
+                wandb.log({'Loss': l2, 'Samples': get_images(params, subkey, x[:wandb.config.log_images])})
             step += 1
 
 if __name__ == '__main__':
