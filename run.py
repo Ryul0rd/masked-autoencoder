@@ -7,9 +7,10 @@ import optax
 import chex
 import torch
 from torch.utils.data import DataLoader
-from torchvision.datasets import MNIST
+from torchvision.datasets import CIFAR10
 from torchvision import transforms
 import wandb
+from PIL import Image
 
 # We need these functions to get our PyTorch DataLoaders to give us numpy arrays
 def numpy_collate(batch):
@@ -40,9 +41,9 @@ class TransformerBlock(hk.Module):
 
 
 class MaskedAutoencoder(hk.Module):
-    def __init__(self, image_resolution=(28, 28), patch_resolution=(7, 7), model_size=256, encoder_blocks=2, decoder_blocks=2, mask_amount=0.75, name=None):
+    def __init__(self, image_shape=(32, 32, 3), patch_resolution=(8, 8), model_size=256, encoder_blocks=2, decoder_blocks=2, mask_amount=1/8, name=None):
         super().__init__(name=name)
-        self.patch_shape = image_resolution[0] // patch_resolution[0], image_resolution[1] // patch_resolution[1]
+        self.patch_shape = image_shape[0] // patch_resolution[0], image_shape[1] // patch_resolution[1]
         self.num_patches = self.patch_shape[0] * self.patch_shape[1]
         self.model_size = model_size
         self.mask_amount = mask_amount
@@ -56,7 +57,7 @@ class MaskedAutoencoder(hk.Module):
         self.decoder = hk.Sequential([TransformerBlock(model_size=model_size, num_heads=2) for _ in range(decoder_blocks)])
         self.unpatch = hk.Sequential([
             hk.Reshape(output_shape=(self.patch_shape[0], self.patch_shape[1], model_size)),
-            hk.Conv2DTranspose(output_channels=1, kernel_shape=patch_resolution, stride=patch_resolution, padding='VALID'), sigmoid,
+            hk.Conv2DTranspose(output_channels=image_shape[2], kernel_shape=patch_resolution, stride=patch_resolution, padding='VALID'), sigmoid,
         ])
 
     def __call__(self, x):
@@ -98,8 +99,8 @@ def main():
         transforms.ToTensor(), # converts our values to be between 0. and 1. for us
         transforms.Lambda(to_numpy),
         ])
-    train_ds = MNIST('/tmp/mnist/', train=True, download=True, transform=transform)
-    test_ds = MNIST('/tmp/mnist/', train=False, download=True, transform=transform)
+    train_ds = CIFAR10('/tmp/cifar10/', train=True, download=True, transform=transform)
+    test_ds = CIFAR10('/tmp/cifar10/', train=False, download=True, transform=transform)
     train_loader = DataLoader(train_ds, batch_size=wandb.config.batch_size, num_workers=0, collate_fn=numpy_collate, drop_last=True)
     test_loader = DataLoader(test_ds, batch_size=len(test_ds), num_workers=0, collate_fn=numpy_collate, drop_last=True)
 
@@ -110,7 +111,7 @@ def main():
     model = hk.transform(lambda x: MaskedAutoencoder()(x))
     # Initialize some paramters using our rng keys and a tracer value
     key, subkey = jax.random.split(key)
-    params = model.init(subkey, jnp.zeros(shape=(wandb.config.batch_size, 28, 28, 1)))
+    params = model.init(subkey, jnp.zeros(shape=(wandb.config.batch_size, 32, 32, 3)))
     # Create and init optimizer
     opt = optax.adam(wandb.config.learning_rate)
     opt_state = opt.init(params)
@@ -135,8 +136,8 @@ def main():
         originals = jnp.concatenate(x, axis=1)
         reconstructed = jnp.concatenate(model.apply(params, rng_key, x), axis=1)
         combined = jnp.concatenate([originals, reconstructed], axis=0)
-        transposed = jnp.transpose(combined, (2, 0, 1))
-        return wandb.Image(np.array(transposed) * 255.0)
+        #transposed = jnp.transpose(combined, (2, 0, 1))
+        return wandb.Image(np.array(combined * 255.0))
 
     # Training loop
     step = 0
