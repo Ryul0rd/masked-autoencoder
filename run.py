@@ -40,38 +40,40 @@ class TransformerBlock(hk.Module):
 
 
 class MaskedAutoencoder(hk.Module):
-    def __init__(self, model_size=128, encoder_blocks=2, decoder_blocks=2, mask_amount=0.6, name=None):
+    def __init__(self, image_resolution=(28, 28), patch_resolution=(7, 7), model_size=256, encoder_blocks=2, decoder_blocks=2, mask_amount=0.75, name=None):
         super().__init__(name=name)
+        self.patch_shape = image_resolution[0] // patch_resolution[0], image_resolution[1] // patch_resolution[1]
+        self.num_patches = self.patch_shape[0] * self.patch_shape[1]
         self.model_size = model_size
         self.mask_amount = mask_amount
 
         self.patch = hk.Sequential([
-            hk.Conv2D(output_channels=model_size, kernel_shape=4, stride=4, padding='VALID'),
-            hk.Reshape(output_shape=(49, model_size)),
+            hk.Conv2D(output_channels=model_size, kernel_shape=patch_resolution, stride=patch_resolution, padding='VALID'),
+            hk.Reshape(output_shape=(self.num_patches, model_size)),
         ])
-        self.pos_embedding = hk.Embed(vocab_size=49, embed_dim=model_size)
+        self.pos_embedding = hk.Embed(vocab_size=self.num_patches, embed_dim=model_size)
         self.encoder = hk.Sequential([TransformerBlock(model_size=model_size, num_heads=2) for _ in range(encoder_blocks)])
         self.decoder = hk.Sequential([TransformerBlock(model_size=model_size, num_heads=2) for _ in range(decoder_blocks)])
         self.unpatch = hk.Sequential([
-            hk.Reshape(output_shape=(7, 7, model_size)),
-            hk.Conv2DTranspose(output_channels=1, kernel_shape=4, stride=4, padding='VALID'), sigmoid,
+            hk.Reshape(output_shape=(self.patch_shape[0], self.patch_shape[1], model_size)),
+            hk.Conv2DTranspose(output_channels=1, kernel_shape=patch_resolution, stride=patch_resolution, padding='VALID'), sigmoid,
         ])
 
     def __call__(self, x):
-        perm = jax.random.permutation(hk.next_rng_key(), 49)
+        perm = jax.random.permutation(hk.next_rng_key(), self.num_patches)
         inv_perm = jnp.argsort(perm)
-        #masked_patches = int(49 * self.mask_amount)
+        masked_patches = int(self.num_patches * self.mask_amount)
 
         x = self.patch(x)
-        x += self.pos_embedding(jnp.arange(49))
-        x = x[:, perm][:, :20] # Permute sequence and chop the good bit off
+        x += self.pos_embedding(jnp.arange(self.num_patches))
+        x = x[:, perm] # Permute sequence
+        x = x[:, masked_patches:] # Chop off the good bit
         x = self.encoder(x)
         mask_embedding = hk.get_parameter('mask_embedding', shape=[self.model_size], dtype=x.dtype, init=jnp.zeros)
-        mask_embedding = jnp.full((x.shape[0], 49, self.model_size), mask_embedding)
-        mask_embedding += self.pos_embedding(jnp.arange(49))
-        mask_embedding = mask_embedding[:, perm][:, 20:]
-        x = jnp.concatenate([x, mask_embedding], axis=1) # Attach 'blank' embeddings
+        mask_embedding = jnp.full((x.shape[0], masked_patches, self.model_size), mask_embedding)
+        x = jnp.concatenate([mask_embedding, x], axis=1) # Attach 'blank'/mask embeddings
         x = x[:, inv_perm] # Reverse permutation
+        x += self.pos_embedding(jnp.arange(self.num_patches))
         x = self.decoder(x)
         x = self.unpatch(x)
         return x
@@ -81,7 +83,7 @@ def main():
     # Hyperparameters
     config = {
         'learning_rate': 3e-4,
-        'epochs': 2,
+        'epochs': 3,
         'batch_size': 32,
         'rng_seed': 42,
         'log_every': 100,
@@ -96,7 +98,6 @@ def main():
         transforms.ToTensor(), # converts our values to be between 0. and 1. for us
         transforms.Lambda(to_numpy),
         ])
-    torch.manual_seed(wandb.config.rng_seed)
     train_ds = MNIST('/tmp/mnist/', train=True, download=True, transform=transform)
     test_ds = MNIST('/tmp/mnist/', train=False, download=True, transform=transform)
     train_loader = DataLoader(train_ds, batch_size=wandb.config.batch_size, num_workers=0, collate_fn=numpy_collate, drop_last=True)
