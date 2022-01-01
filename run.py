@@ -5,6 +5,7 @@ import numpy as np
 import haiku as hk
 import optax
 import chex
+import torch
 from torch.utils.data import DataLoader
 from torchvision.datasets import MNIST
 from torchvision import transforms
@@ -39,8 +40,11 @@ class TransformerBlock(hk.Module):
 
 
 class MaskedAutoencoder(hk.Module):
-    def __init__(self, model_size=128, encoder_blocks=2, decoder_blocks=2, name=None):
+    def __init__(self, model_size=128, encoder_blocks=2, decoder_blocks=2, mask_amount=0.6, name=None):
         super().__init__(name=name)
+        self.model_size = model_size
+        self.mask_amount = mask_amount
+
         self.patch = hk.Sequential([
             hk.Conv2D(output_channels=model_size, kernel_shape=4, stride=4, padding='VALID'),
             hk.Reshape(output_shape=(49, model_size)),
@@ -50,17 +54,24 @@ class MaskedAutoencoder(hk.Module):
         self.decoder = hk.Sequential([TransformerBlock(model_size=model_size, num_heads=2) for _ in range(decoder_blocks)])
         self.unpatch = hk.Sequential([
             hk.Reshape(output_shape=(7, 7, model_size)),
-            hk.Conv2DTranspose(output_channels=1, kernel_shape=4, stride=4, padding='VALID'),
+            hk.Conv2DTranspose(output_channels=1, kernel_shape=4, stride=4, padding='VALID'), sigmoid,
         ])
 
     def __call__(self, x):
+        perm = jax.random.permutation(hk.next_rng_key(), 49)
+        inv_perm = jnp.argsort(perm)
+        #masked_patches = int(49 * self.mask_amount)
+
         x = self.patch(x)
         x += self.pos_embedding(jnp.arange(49))
-        # Permute sequence
-        # Chop off last bit
+        x = x[:, perm][:, :20] # Permute sequence and chop the good bit off
         x = self.encoder(x)
-        # Attach 'blank' embeddings
-        # Reverse permutation
+        mask_embedding = hk.get_parameter('mask_embedding', shape=[self.model_size], dtype=x.dtype, init=jnp.zeros)
+        mask_embedding = jnp.full((x.shape[0], 49, self.model_size), mask_embedding)
+        mask_embedding += self.pos_embedding(jnp.arange(49))
+        mask_embedding = mask_embedding[:, perm][:, 20:]
+        x = jnp.concatenate([x, mask_embedding], axis=1) # Attach 'blank' embeddings
+        x = x[:, inv_perm] # Reverse permutation
         x = self.decoder(x)
         x = self.unpatch(x)
         return x
@@ -85,6 +96,7 @@ def main():
         transforms.ToTensor(), # converts our values to be between 0. and 1. for us
         transforms.Lambda(to_numpy),
         ])
+    torch.manual_seed(wandb.config.rng_seed)
     train_ds = MNIST('/tmp/mnist/', train=True, download=True, transform=transform)
     test_ds = MNIST('/tmp/mnist/', train=False, download=True, transform=transform)
     train_loader = DataLoader(train_ds, batch_size=wandb.config.batch_size, num_workers=0, collate_fn=numpy_collate, drop_last=True)
@@ -97,9 +109,7 @@ def main():
     model = hk.transform(lambda x: MaskedAutoencoder()(x))
     # Initialize some paramters using our rng keys and a tracer value
     key, subkey = jax.random.split(key)
-    print('Got here 1')
     params = model.init(subkey, jnp.zeros(shape=(wandb.config.batch_size, 28, 28, 1)))
-    print('Got here 2')
     # Create and init optimizer
     opt = optax.adam(wandb.config.learning_rate)
     opt_state = opt.init(params)
@@ -137,8 +147,7 @@ def main():
             params, opt_state, loss = update(params, opt_state, subkey, x, y)
             if step % wandb.config.log_every == 0:
                 key, subkey = jax.random.split(key)
-                #wandb.log({'Loss': loss, 'Samples': get_images(params, subkey, x[:wandb.config.log_images])})
-                wandb.log({'Loss': loss, 'Samples': get_images(params, subkey, x)})
+                wandb.log({'Loss': loss, 'Samples': get_images(params, subkey, x[:wandb.config.log_images])})
             step += 1
 
 if __name__ == '__main__':
