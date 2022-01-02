@@ -43,22 +43,23 @@ class TransformerBlock(hk.Module):
 
 
 class MaskedAutoencoder(hk.Module):
-    def __init__(self, image_shape=(32, 32, 3), patch_resolution=(4, 4), model_size=256, num_heads=2,
-                 encoder_blocks=2, decoder_blocks=2, mask_amount=3/4, name=None):
+    def __init__(self, image_shape=(32, 32, 3), patch_resolution=(4, 4), mask_amount=3/4, num_heads=2,
+                 d_encoder=256, d_decoder=128, encoder_blocks=2, decoder_blocks=2, name=None):
         super().__init__(name=name)
         self.patch_shape = image_shape[0] // patch_resolution[0], image_shape[1] // patch_resolution[1]
         self.num_patches = self.patch_shape[0] * self.patch_shape[1]
-        self.model_size = model_size
+        self.d_encoder = d_encoder
         self.mask_amount = mask_amount
 
         self.patch = hk.Sequential([
-            hk.Conv2D(output_channels=model_size, kernel_shape=patch_resolution, stride=patch_resolution, padding='VALID'),
-            hk.Reshape(output_shape=(self.num_patches, model_size)),
+            hk.Conv2D(output_channels=d_encoder, kernel_shape=patch_resolution, stride=patch_resolution, padding='VALID'),
+            hk.Reshape(output_shape=(self.num_patches, d_encoder)),
         ])
-        self.encoder = hk.Sequential([TransformerBlock(model_size=model_size, num_heads=num_heads) for _ in range(encoder_blocks)])
-        self.decoder = hk.Sequential([TransformerBlock(model_size=model_size, num_heads=num_heads) for _ in range(decoder_blocks)])
+        self.encoder = hk.Sequential([TransformerBlock(model_size=d_encoder, num_heads=num_heads) for _ in range(encoder_blocks)])
+        self.projection = hk.Linear(d_decoder)
+        self.decoder = hk.Sequential([TransformerBlock(model_size=d_decoder, num_heads=num_heads) for _ in range(decoder_blocks)])
         self.unpatch = hk.Sequential([
-            hk.Reshape(output_shape=(self.patch_shape[0], self.patch_shape[1], model_size)),
+            hk.Reshape(output_shape=(self.patch_shape[0], self.patch_shape[1], d_decoder)),
             hk.Conv2DTranspose(output_channels=image_shape[2], kernel_shape=patch_resolution, stride=patch_resolution, padding='VALID'), sigmoid,
         ])
 
@@ -66,36 +67,38 @@ class MaskedAutoencoder(hk.Module):
         perm = jax.random.permutation(hk.next_rng_key(), self.num_patches)
         inv_perm = jnp.argsort(perm)
         masked_patches = int(self.num_patches * self.mask_amount)
-        pos_embedding = hk.get_parameter('pos_embedding', shape=[self.num_patches, self.model_size], dtype=x.dtype, init=hk.initializers.TruncatedNormal())
+        pos_embedding = hk.get_parameter('pos_embedding', shape=[self.num_patches, self.d_encoder], dtype=x.dtype, init=hk.initializers.TruncatedNormal())
 
         x = self.patch(x)
         x += pos_embedding
         x = x[:, perm] # Permute sequence
         x = x[:, masked_patches:] # Chop off the good bit
         x = self.encoder(x)
-        mask_embedding = hk.get_parameter('mask_embedding', shape=[self.model_size], dtype=x.dtype, init=jnp.zeros)
-        mask_embedding = jnp.full((x.shape[0], masked_patches, self.model_size), mask_embedding)
+        mask_embedding = hk.get_parameter('mask_embedding', shape=[self.d_encoder], dtype=x.dtype, init=jnp.zeros)
+        mask_embedding = jnp.full((x.shape[0], masked_patches, self.d_encoder), mask_embedding)
         x = jnp.concatenate([mask_embedding, x], axis=1) # Attach 'blank'/mask embeddings
         x = x[:, inv_perm] # Reverse permutation
         x += pos_embedding
+        x = self.projection(x)
         x = self.decoder(x)
         x = self.unpatch(x)
         return x
 
 def main():
-
-    # Hyperparameters
     config = {
         'learning_rate': 3e-4,
-        'epochs': 2,
+        'warmup_steps': 5000,
+        'epochs': 15,
         'batch_size': 32,
         'patch_resolution': (4, 4),
         'mask_amount': 3/4,
-        'model_size': 256,
+        'num_heads': 2,
+        'd_encoder': 256,
+        'd_decoder': 192,
         'encoder_depth': 2,
         'decoder_depth': 2,
         'rng_seed': 42,
-        'log_every': 100,
+        'log_every': 25,
         'log_images': 8,
         }
 
@@ -108,7 +111,7 @@ def main():
         transforms.Lambda(to_numpy),
         ])
     train_ds = CIFAR10('~/Documents/datasets/cifar10/', train=True, download=True, transform=transform)
-    test_ds = CIFAR10('~/Documents/datasets/cifar10/', train=False, download=True, transform=transform)
+    test_ds = CIFAR10('~/Documents/datasets/cifar10/', train=False, download=False, transform=transform)
     train_loader = DataLoader(train_ds, batch_size=wandb.config.batch_size, num_workers=0, collate_fn=numpy_collate, drop_last=True)
     test_loader = DataLoader(test_ds, batch_size=len(test_ds), num_workers=0, collate_fn=numpy_collate, drop_last=True)
 
@@ -118,14 +121,16 @@ def main():
     # Define a model fn then transform it to be functionally pure
     def f_model(x):
         nn = MaskedAutoencoder(patch_resolution=wandb.config.patch_resolution, mask_amount=wandb.config.mask_amount,
-                               model_size=wandb.config.model_size, encoder_blocks=wandb.config.encoder_depth, decoder_blocks=wandb.config.decoder_depth)
+                               num_heads=wandb.config.num_heads, d_encoder=wandb.config.d_encoder, d_decoder=wandb.config.d_decoder,
+                               encoder_blocks=wandb.config.encoder_depth, decoder_blocks=wandb.config.decoder_depth)
         return nn(x)
     model = hk.transform(f_model)
     # Initialize some paramters using our rng keys and a tracer value
     key, subkey = jax.random.split(key)
     params = model.init(subkey, jnp.zeros(shape=(wandb.config.batch_size, 32, 32, 3)))
     # Create and init optimizer
-    opt = optax.adam(wandb.config.learning_rate)
+    lr_schedule = optax.linear_schedule(wandb.config.learning_rate / 1000, wandb.config.learning_rate, wandb.config.warmup_steps)
+    opt = optax.adam(lr_schedule)
     opt_state = opt.init(params)
 
     # Define our loss function
