@@ -4,13 +4,11 @@ from jax.nn import relu, sigmoid
 import numpy as np
 import haiku as hk
 import optax
-import chex
-import torch
 from torch.utils.data import DataLoader
 from torchvision.datasets import CIFAR10
 from torchvision import transforms
+from tqdm import tqdm
 import wandb
-from PIL import Image
 
 # We need these functions to get our PyTorch DataLoaders to give us numpy arrays
 def numpy_collate(batch):
@@ -41,7 +39,8 @@ class TransformerBlock(hk.Module):
 
 
 class MaskedAutoencoder(hk.Module):
-    def __init__(self, image_shape=(32, 32, 3), patch_resolution=(8, 8), model_size=256, encoder_blocks=2, decoder_blocks=2, mask_amount=1/8, name=None):
+    def __init__(self, image_shape=(32, 32, 3), patch_resolution=(4, 4), model_size=256,
+                 encoder_blocks=2, decoder_blocks=2, mask_amount=3/4, name=None):
         super().__init__(name=name)
         self.patch_shape = image_shape[0] // patch_resolution[0], image_shape[1] // patch_resolution[1]
         self.num_patches = self.patch_shape[0] * self.patch_shape[1]
@@ -84,8 +83,13 @@ def main():
     # Hyperparameters
     config = {
         'learning_rate': 3e-4,
-        'epochs': 3,
+        'epochs': 2,
         'batch_size': 32,
+        'patch_resolution': (4, 4),
+        'mask_amount': 3/4,
+        'model_size': 256,
+        'encoder_depth': 2,
+        'decoder_depth': 2,
         'rng_seed': 42,
         'log_every': 100,
         'log_images': 8,
@@ -108,7 +112,11 @@ def main():
     key = jax.random.PRNGKey(wandb.config.rng_seed)
 
     # Define a model fn then transform it to be functionally pure
-    model = hk.transform(lambda x: MaskedAutoencoder()(x))
+    def f_model(x):
+        nn = MaskedAutoencoder(patch_resolution=wandb.config.patch_resolution, mask_amount=wandb.config.mask_amount,
+                               model_size=wandb.config.model_size, encoder_blocks=wandb.config.encoder_depth, decoder_blocks=wandb.config.decoder_depth)
+        return nn(x)
+    model = hk.transform(f_model)
     # Initialize some paramters using our rng keys and a tracer value
     key, subkey = jax.random.split(key)
     params = model.init(subkey, jnp.zeros(shape=(wandb.config.batch_size, 32, 32, 3)))
@@ -136,20 +144,18 @@ def main():
         originals = jnp.concatenate(x, axis=1)
         reconstructed = jnp.concatenate(model.apply(params, rng_key, x), axis=1)
         combined = jnp.concatenate([originals, reconstructed], axis=0)
-        #transposed = jnp.transpose(combined, (2, 0, 1))
         return wandb.Image(np.array(combined * 255.0))
 
     # Training loop
     step = 0
     for epoch in range(wandb.config.epochs):
-        print(f'Starting epoch {epoch + 1}/{wandb.config.epochs}')
-        for x, y in train_loader:
+        for x, y in tqdm(train_loader, desc=f'Epoch {epoch + 1}/{wandb.config.epochs}'):
             x = jnp.transpose(x, (0, 2, 3, 1))
             key, subkey = jax.random.split(key)
             params, opt_state, loss = update(params, opt_state, subkey, x, y)
             if step % wandb.config.log_every == 0:
                 key, subkey = jax.random.split(key)
-                wandb.log({'Loss': loss, 'Samples': get_images(params, subkey, x[:wandb.config.log_images])})
+                wandb.log({'Loss': loss, 'Samples': get_images(params, subkey, x[:wandb.config.log_images])}, step=step)
             step += 1
 
 if __name__ == '__main__':
