@@ -26,15 +26,19 @@ def to_numpy(pic):
 class TransformerBlock(hk.Module):
     def __init__(self, model_size, num_heads, name=None):
         super().__init__(name=name)
+        self.ln1 = hk.LayerNorm(-1, False, False)
         self.mha = hk.MultiHeadAttention(num_heads=num_heads, key_size=model_size, w_init_scale=1.0, model_size=model_size)
+        self.ln2 = hk.LayerNorm(-1, False, False)
         self.mlp = hk.Sequential([
             hk.Linear(model_size), relu,
             hk.Linear(model_size), relu,
         ])
 
     def __call__(self, x):
-        x = self.mha(x, x, x) + x
-        x = self.mlp(x) + x
+        norm = self.ln1(x)
+        x += self.mha(norm, norm, norm)
+        norm = self.ln2(x)
+        x += self.mlp(norm)
         return x
 
 
