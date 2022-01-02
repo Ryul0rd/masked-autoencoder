@@ -43,7 +43,7 @@ class TransformerBlock(hk.Module):
 
 
 class MaskedAutoencoder(hk.Module):
-    def __init__(self, image_shape=(32, 32, 3), patch_resolution=(4, 4), model_size=256,
+    def __init__(self, image_shape=(32, 32, 3), patch_resolution=(4, 4), model_size=256, num_heads=2,
                  encoder_blocks=2, decoder_blocks=2, mask_amount=3/4, name=None):
         super().__init__(name=name)
         self.patch_shape = image_shape[0] // patch_resolution[0], image_shape[1] // patch_resolution[1]
@@ -55,9 +55,8 @@ class MaskedAutoencoder(hk.Module):
             hk.Conv2D(output_channels=model_size, kernel_shape=patch_resolution, stride=patch_resolution, padding='VALID'),
             hk.Reshape(output_shape=(self.num_patches, model_size)),
         ])
-        self.pos_embedding = hk.Embed(vocab_size=self.num_patches, embed_dim=model_size)
-        self.encoder = hk.Sequential([TransformerBlock(model_size=model_size, num_heads=2) for _ in range(encoder_blocks)])
-        self.decoder = hk.Sequential([TransformerBlock(model_size=model_size, num_heads=2) for _ in range(decoder_blocks)])
+        self.encoder = hk.Sequential([TransformerBlock(model_size=model_size, num_heads=num_heads) for _ in range(encoder_blocks)])
+        self.decoder = hk.Sequential([TransformerBlock(model_size=model_size, num_heads=num_heads) for _ in range(decoder_blocks)])
         self.unpatch = hk.Sequential([
             hk.Reshape(output_shape=(self.patch_shape[0], self.patch_shape[1], model_size)),
             hk.Conv2DTranspose(output_channels=image_shape[2], kernel_shape=patch_resolution, stride=patch_resolution, padding='VALID'), sigmoid,
@@ -67,9 +66,10 @@ class MaskedAutoencoder(hk.Module):
         perm = jax.random.permutation(hk.next_rng_key(), self.num_patches)
         inv_perm = jnp.argsort(perm)
         masked_patches = int(self.num_patches * self.mask_amount)
+        pos_embedding = hk.get_parameter('pos_embedding', shape=[self.num_patches, self.model_size], dtype=x.dtype, init=hk.initializers.TruncatedNormal())
 
         x = self.patch(x)
-        x += self.pos_embedding(jnp.arange(self.num_patches))
+        x += pos_embedding
         x = x[:, perm] # Permute sequence
         x = x[:, masked_patches:] # Chop off the good bit
         x = self.encoder(x)
@@ -77,7 +77,7 @@ class MaskedAutoencoder(hk.Module):
         mask_embedding = jnp.full((x.shape[0], masked_patches, self.model_size), mask_embedding)
         x = jnp.concatenate([mask_embedding, x], axis=1) # Attach 'blank'/mask embeddings
         x = x[:, inv_perm] # Reverse permutation
-        x += self.pos_embedding(jnp.arange(self.num_patches))
+        x += pos_embedding
         x = self.decoder(x)
         x = self.unpatch(x)
         return x
@@ -87,13 +87,13 @@ def main():
     # Hyperparameters
     config = {
         'learning_rate': 3e-4,
-        'epochs': 2,
+        'epochs': 5,
         'batch_size': 32,
         'patch_resolution': (4, 4),
         'mask_amount': 3/4,
         'model_size': 256,
-        'encoder_depth': 2,
-        'decoder_depth': 2,
+        'encoder_depth': 8,
+        'decoder_depth': 8,
         'rng_seed': 42,
         'log_every': 100,
         'log_images': 8,
