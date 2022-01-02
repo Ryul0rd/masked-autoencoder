@@ -87,13 +87,13 @@ def main():
     # Hyperparameters
     config = {
         'learning_rate': 3e-4,
-        'epochs': 5,
+        'epochs': 2,
         'batch_size': 32,
         'patch_resolution': (4, 4),
         'mask_amount': 3/4,
         'model_size': 256,
-        'encoder_depth': 8,
-        'decoder_depth': 8,
+        'encoder_depth': 2,
+        'decoder_depth': 2,
         'rng_seed': 42,
         'log_every': 100,
         'log_images': 8,
@@ -107,8 +107,8 @@ def main():
         transforms.ToTensor(), # converts our values to be between 0. and 1. for us
         transforms.Lambda(to_numpy),
         ])
-    train_ds = CIFAR10('/tmp/cifar10/', train=True, download=True, transform=transform)
-    test_ds = CIFAR10('/tmp/cifar10/', train=False, download=True, transform=transform)
+    train_ds = CIFAR10('~/Documents/datasets/cifar10/', train=True, download=True, transform=transform)
+    test_ds = CIFAR10('~/Documents/datasets/cifar10/', train=False, download=True, transform=transform)
     train_loader = DataLoader(train_ds, batch_size=wandb.config.batch_size, num_workers=0, collate_fn=numpy_collate, drop_last=True)
     test_loader = DataLoader(test_ds, batch_size=len(test_ds), num_workers=0, collate_fn=numpy_collate, drop_last=True)
 
