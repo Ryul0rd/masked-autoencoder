@@ -98,7 +98,7 @@ def main():
         'encoder_depth': 2,
         'decoder_depth': 2,
         'rng_seed': 42,
-        'log_every': 25,
+        'log_every': 50,
         'log_images': 8,
         }
 
@@ -109,11 +109,12 @@ def main():
     transform = transforms.Compose([
         transforms.ToTensor(), # converts our values to be between 0. and 1. for us
         transforms.Lambda(to_numpy),
+        transforms.Lambda(lambda x: jnp.transpose(x, (1, 2, 0))),
         ])
     train_ds = CIFAR10('~/Documents/datasets/cifar10/', train=True, download=True, transform=transform)
     test_ds = CIFAR10('~/Documents/datasets/cifar10/', train=False, download=False, transform=transform)
     train_loader = DataLoader(train_ds, batch_size=wandb.config.batch_size, num_workers=0, collate_fn=numpy_collate, drop_last=True)
-    test_loader = DataLoader(test_ds, batch_size=len(test_ds), num_workers=0, collate_fn=numpy_collate, drop_last=True)
+    test_loader = DataLoader(test_ds, batch_size=wandb.config.batch_size, num_workers=0, collate_fn=numpy_collate, drop_last=True)
 
     # Create our rng key
     key = jax.random.PRNGKey(wandb.config.rng_seed)
@@ -127,9 +128,10 @@ def main():
     model = hk.transform(f_model)
     # Initialize some paramters using our rng keys and a tracer value
     key, subkey = jax.random.split(key)
-    params = model.init(subkey, jnp.zeros(shape=(wandb.config.batch_size, 32, 32, 3)))
+    params = model.init(subkey, jnp.zeros((wandb.config.batch_size, 32, 32, 3)))
     # Create and init optimizer
-    lr_schedule = optax.linear_schedule(wandb.config.learning_rate / 1000, wandb.config.learning_rate, wandb.config.warmup_steps)
+    lr_schedule = optax.warmup_cosine_decay_schedule(wandb.config.learning_rate / 10000, wandb.config.learning_rate, 
+                                                     wandb.config.warmup_steps, wandb.config.epochs * 1562)
     opt = optax.adam(lr_schedule)
     opt_state = opt.init(params)
 
@@ -159,13 +161,19 @@ def main():
     step = 0
     for epoch in range(wandb.config.epochs):
         for x, y in tqdm(train_loader, desc=f'Epoch {epoch + 1}/{wandb.config.epochs}'):
-            x = jnp.transpose(x, (0, 2, 3, 1))
             key, subkey = jax.random.split(key)
             params, opt_state, loss = update(params, opt_state, subkey, x, y)
             if step % wandb.config.log_every == 0:
                 key, subkey = jax.random.split(key)
                 wandb.log({'Loss': loss, 'Samples': get_images(params, subkey, x[:wandb.config.log_images])}, step=step)
             step += 1
+        key, subkey = jax.random.split(key)
+        val_loss = 0
+        for x, y in test_loader:
+            val_loss += l2_loss(params, subkey, x)
+        val_loss /= len(test_ds) / wandb.config.batch_size
+        wandb.log({'Val Loss': val_loss, 'Val Samples': get_images(params, subkey, x[:wandb.config.log_images])}, step=step)
+        
 
 if __name__ == '__main__':
     main()
