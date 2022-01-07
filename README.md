@@ -1,2 +1,2 @@
 # masked-autoencoder
-Implementation of https://arxiv.org/abs/2111.06377
+Implementation of [Masked Autoencoder Are Scalable Vision Learners](https://arxiv.org/abs/2111.06377)
